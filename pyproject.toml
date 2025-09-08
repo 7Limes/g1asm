@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "g1asm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Assembler implementation for the g1 ISA"
 authors = ["7Limes"]
 readme = "README.md"
