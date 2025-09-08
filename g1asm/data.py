@@ -17,7 +17,7 @@ def error(line_number: str, message: str):
 
 
 # returns True if succeeded, False otherwise
-def add_data_entry(parsed_data: list, memory_size: int, line_number: int, entry: list) -> bool:
+def add_data_entry(parsed_data: list, memory_size: int, line_number: int, entry: tuple[int, list[int]]) -> bool:
     address, numbers = entry
     if address+len(numbers) > memory_size:
         error(line_number, 'Entry data size exceeds memory capacity. Consider allocating more memory.')
@@ -117,7 +117,7 @@ def parse_entry(data_type: str, operation: str, data: str) -> list[int] | str:
     return operation_result
 
 
-def parse_data(data_entries: str, memory_size: int) -> list | None:
+def parse_data(data_entries: str, memory_size: int) -> list[tuple[int, list[int]]] | None:
     pattern = re.compile(DATA_LINE_REGEX);
     parsed_data = []
     for line_number, line in enumerate(data_entries.split('\n')):
@@ -135,7 +135,7 @@ def parse_data(data_entries: str, memory_size: int) -> list | None:
         if isinstance(parse_entry_result, str):
             error(line_number, parse_entry_result)
 
-        added = add_data_entry(parsed_data, memory_size, line_number, [address, parse_entry_result])
+        added = add_data_entry(parsed_data, memory_size, line_number, (address, parse_entry_result))
         if not added:
             return None
 

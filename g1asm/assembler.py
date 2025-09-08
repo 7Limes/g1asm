@@ -12,15 +12,12 @@ import json
 from enum import Enum
 from typing import Literal
 import argparse
+from dataclasses import dataclass, field
 from rply import LexerGenerator, Token, LexingError
+from rply.lexer import LexerStream
 from g1asm.data import parse_data
-from g1asm.binary_format import G1BinaryFormat, format_json
+from g1asm.binary_format import G1BinaryFormat, ARG_TYPE_LITERAL, ARG_TYPE_ADDRESS, OPCODE_LOOKUP
 from g1asm.instructions import INSTRUCTIONS, ARGUMENT_COUNT_LOOKUP, ASSIGNMENT_INSTRUCTIONS
-
-
-class AssemblerState(Enum):
-    META = 1
-    PROCEDURES = 2
 
 
 lg = LexerGenerator()
@@ -53,6 +50,95 @@ COLOR_WARN = '\x1b[33m'
 COLOR_RESET = '\x1b[0m'
 
 
+class AssemblerState(Enum):
+    META = 1
+    PROCEDURES = 2
+
+
+@dataclass
+class AssemblerData:
+    meta: dict[str, int] = field(default_factory=lambda: META_VARIABLES.copy())
+    labels: dict[str, int] = field(default_factory=dict)
+    instruction_tokens: list[tuple[Token, list[Token]]] = field(default_factory=list)
+    instruction_index: int = 0
+    state: AssemblerState = AssemblerState.META
+
+    instructions: list[tuple[str, list[str | int], int]] = field(default_factory=list)
+    start_label: int = -1
+    tick_label: int = -1
+    data_entries: list[tuple[int, list[int]]] | None = None
+
+    source_lines: list[str] | None = None
+
+
+    def add_data_entries(self, data_file_path: str):
+        if os.path.isfile(data_file_path):
+            with open(data_file_path, 'r') as f:
+                data = parse_data(f.read(), self.meta['memory'])
+                if data is not None:
+                    self.data_entries = data
+        else:
+            print('Could not find data file at "{data_file_path}".')
+
+
+    def assemble_json(self) -> bytes:
+        output_json = {
+            'meta': self.meta,
+            'instructions': self.instructions
+        }
+
+        if self.start_label != -1:
+            output_json['start'] = self.start_label
+        if self.tick_label != -1:
+            output_json['tick'] = self.tick_label
+        
+        if self.data_entries is not None:
+            output_json['data'] = self.data_entries
+        
+        if self.source_lines is not None:
+            output_json['source'] = self.source_lines
+        
+        return json.dumps(output_json, separators=(',', ':')).encode('utf-8')
+
+    
+    def assemble_binary(self) -> bytes:
+        file_dict = {
+            'meta': self.meta,
+            'instruction_count': len(self.instructions),
+            'start': self.start_label,
+            'tick': self.tick_label
+        }
+
+        formatted_instructions = []
+        for instruction_data in self.instructions:
+            instruction_name, arguments = instruction_data[:2]  # only grab the first 2 in case of debug mode
+            formatted_arguments = []
+            for argument in arguments:
+                if isinstance(argument, int):
+                    formatted_arguments.append({'type': ARG_TYPE_LITERAL, 'value': argument})
+                else:
+                    formatted_arguments.append({'type': ARG_TYPE_ADDRESS, 'value': int(argument[1:])})
+            instruction_opcode = OPCODE_LOOKUP[instruction_name]
+            verbose_instruction = {
+                'opcode': instruction_opcode,
+                'arguments': formatted_arguments
+            }
+            formatted_instructions.append(verbose_instruction)
+        file_dict['instructions'] = formatted_instructions
+
+        if self.data_entries is not None:
+            formatted_data_entries = []
+            for address, data_values in self.data_entries:
+                formatted_data_entries.append({'address': address, 'size': len(data_values), 'values': data_values})
+            file_dict['data_entry_count'] = len(formatted_data_entries)
+            file_dict['data'] = formatted_data_entries
+        else:
+            file_dict['data_entry_count'] = 0
+            file_dict['data'] = {}
+        
+        return G1BinaryFormat.build(file_dict)
+
+
 def error(token: Token, source_lines: list[str], message: str):
     line_number = token.source_pos.lineno-1
     column_number = token.source_pos.colno-1
@@ -72,7 +158,7 @@ def warn(token: Token, source_lines: list[str], message: str):
     print(COLOR_RESET, end='')
 
 
-def get_until_newline(tokens: list[Token]) -> list[Token]:
+def get_until_newline(tokens: LexerStream) -> list[Token]:
     returned_tokens = []
     while True:
         token = tokens.next()
@@ -102,30 +188,26 @@ def parse_argument_token(token: Token, labels: dict[str, int], source_lines: lis
     return token.value
 
 
-def assemble_tokens(tokens: list[Token], source_lines: list[str], compiler_state: AssemblerState, include_source: bool=False) -> dict:
-    output_json = {'meta': META_VARIABLES.copy()}
-    
-    labels = {}
-    raw_instructions = []
-    instruction_index = 0
+def assemble_tokens(tokens: LexerStream, source_lines: list[str], include_source: bool=False):
+    assembler_data = AssemblerData()
 
     for token in tokens:
         if token.name == 'META_VARIABLE':
-            if compiler_state != AssemblerState.META:
+            if assembler_data.state != AssemblerState.META:
                 error(token, source_lines, f'Found meta variable outside file header.')
             meta_variable_name = token.value[1:]
             if meta_variable_name not in META_VARIABLES:
                 error(token, source_lines, f'Unrecognized meta variable "{meta_variable_name}".')
-            output_json['meta'][meta_variable_name] = int(tokens.next().value)
+            assembler_data.meta[meta_variable_name] = int(tokens.next().value)
         
         elif token.name == 'LABEL_NAME':
-            if compiler_state != AssemblerState.PROCEDURES:
-                compiler_state = AssemblerState.PROCEDURES
+            if assembler_data.state != AssemblerState.PROCEDURES:
+                assembler_data.state = AssemblerState.PROCEDURES
             label_name = token.value[:-1]
-            if label_name in labels:
+            if label_name in assembler_data.labels:
                 warn(token, source_lines, f'Label "{label_name}" declared more than once.')
             else:
-                labels[label_name] = instruction_index
+                assembler_data.labels[label_name] = assembler_data.instruction_index
         
         elif token.name == 'NAME':
             if token.value not in INSTRUCTIONS:
@@ -136,8 +218,8 @@ def assemble_tokens(tokens: list[Token], source_lines: list[str], compiler_state
             instruction_args = get_until_newline(tokens)
             if len(instruction_args) != instruction_arg_amount:
                 error(token, source_lines, f'Expected {instruction_arg_amount} argument(s) for instruction "{instruction_name_token}" but got {len(instruction_args)}.')
-            raw_instructions.append([token, instruction_args])
-            instruction_index += 1
+            assembler_data.instruction_tokens.append((token, instruction_args))
+            assembler_data.instruction_index += 1
         
         elif token.name in {'NUMBER', 'ADDRESS'}:
             error(token, source_lines, 'Value outside of instruction.')
@@ -146,29 +228,31 @@ def assemble_tokens(tokens: list[Token], source_lines: list[str], compiler_state
             continue
     
     # Parse instruction args
-    instructions = []
-    for instruction_name_token, instruction_args_tokens in raw_instructions:
-        instruction_name = instruction_name_token.value 
-        instruction_args = [parse_argument_token(t, labels, source_lines) for t in instruction_args_tokens]
-        instruction_data = [instruction_name, instruction_args]
+    for instruction_name_token, instruction_args_tokens in assembler_data.instruction_tokens:
+        instruction_name: str = instruction_name_token.value 
+        instruction_args = [parse_argument_token(t, assembler_data.labels, source_lines) for t in instruction_args_tokens]
         first_argument = instruction_args[0]
         if instruction_name in ASSIGNMENT_INSTRUCTIONS and isinstance(first_argument, int) and first_argument <= 11:
             warn(instruction_args_tokens[0], source_lines, 'Assignment to a reserved memory location.')
         if include_source:
-            instruction_data.append(instruction_name_token.source_pos.lineno-1)
-        instructions.append(instruction_data)
+            instruction_data = (instruction_name, instruction_args, instruction_name_token.source_pos.lineno-1)
+        else:
+            instruction_data = (instruction_name, instruction_args)
+        assembler_data.instructions.append(instruction_data)
     
-    output_json['instructions'] = instructions
-    if 'tick' in labels:
-        output_json['tick'] = labels['tick']
+    # Check for start and tick labels
+    if 'tick' in assembler_data.labels:
+        assembler_data.tick_label = assembler_data.labels['tick']
     else:
         print('WARNING: "tick" label not found in program.')
-    if 'start' in labels:
-        output_json['start'] = labels['start']
+    if 'start' in assembler_data.labels:
+        assembler_data.start_label = assembler_data.labels['start']
     
+    # Add source lines if necessary
     if include_source:
-        output_json['source'] = source_lines
-    return output_json
+        assembler_data.source_lines = source_lines
+    
+    return assembler_data
 
 
 def assemble(input_path: str, output_path: str, data_file_path: str|None, include_source: bool, output_format: OUTPUT_FORMATS):
@@ -180,26 +264,19 @@ def assemble(input_path: str, output_path: str, data_file_path: str|None, includ
     source_lines = source_code.split('\n')
     tokens = lexer.lex(source_code + '\n')
     try:
-        output_json = assemble_tokens(tokens, source_lines, AssemblerState.META, include_source)
+        assembler_data = assemble_tokens(tokens, source_lines, include_source)
     except LexingError as e:
         error(e, source_lines, 'Unrecognized token.')
     
     # Add data entries
     if data_file_path is not None:
-        if os.path.isfile(data_file_path):
-            with open(data_file_path, 'r') as f:
-                data = parse_data(f.read(), output_json['meta']['memory'])
-                if data is not None:
-                    output_json['data'] = data
-        else:
-            print('Could not find data file at "{data_file_path}".')
+        assembler_data.add_data_entries(data_file_path)
 
     # Set file content based on the output format
     if output_format == 'json':
-        file_content = json.dumps(output_json, separators=(',', ':')).encode('utf-8')
+        file_content = assembler_data.assemble_json()
     else:
-        formatted_json = format_json(output_json)
-        file_content = G1BinaryFormat.build(formatted_json)
+        file_content = assembler_data.assemble_binary()
     
     # Write the output file
     with open(output_path, 'wb') as f:

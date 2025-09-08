@@ -1,12 +1,8 @@
 from construct import Struct, Const, Int32ub, Int32sb, Int16ub, Int8ub, Array, this, Computed
-from typing import Any
-from construct.lib import Container, ListContainer
-from io import BytesIO
-
-from g1.instructions.instructions import INSTRUCTIONS, ARGUMENT_COUNTS
+from g1asm.instructions import INSTRUCTIONS, ARGUMENT_COUNTS
 
 
-INSTRUCTION_IDS = {ins: i for i, ins in enumerate(INSTRUCTIONS)}
+OPCODE_LOOKUP = {ins: i for i, ins in enumerate(INSTRUCTIONS)}
 SIGNATURE = b'g1'
 
 ARG_TYPE_LITERAL = 0
@@ -20,8 +16,8 @@ G1Argument = Struct(
 
 
 G1Instruction = Struct(
-    'id' / Int8ub,
-    'argument_count' / Computed(lambda ctx: ARGUMENT_COUNTS[ctx.id]),
+    'opcode' / Int8ub,
+    'argument_count' / Computed(lambda ctx: ARGUMENT_COUNTS[ctx.opcode]),
     'arguments' / Array(this.argument_count, G1Argument)
 )
 
@@ -68,7 +64,7 @@ def format_json(program_json: dict):
                 verbose_arguments.append({'type': ARG_TYPE_LITERAL, 'value': argument})
             else:
                 verbose_arguments.append({'type': ARG_TYPE_ADDRESS, 'value': int(argument[1:])})
-        instruction_id = INSTRUCTION_IDS[instruction_name]
+        instruction_id = OPCODE_LOOKUP[instruction_name]
         verbose_instruction = {
             'id': instruction_id,
             'arguments': verbose_arguments
