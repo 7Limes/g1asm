@@ -1,0 +1,4 @@
+appdirs==1.4.4
+construct==2.10.70
+pillow==11.3.0
+rply==0.7.8
