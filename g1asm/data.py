@@ -76,7 +76,7 @@ def pack_operation(data: bytes) -> list[int]:
     result = []
     for i in range(0, len(data), 4):
         chunk = data[i:i+4]
-        value = int.from_bytes(chunk, byteorder='big', signed=False)
+        value = int.from_bytes(chunk, byteorder='big', signed=True)
         result.append(value)
     
     return result
