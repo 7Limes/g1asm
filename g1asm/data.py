@@ -1,5 +1,5 @@
 """
-Allows external data to be attached to assembled g1 programs via g1d files.
+Allows external data to be attached to assembled g1 programs.
 """
 
 import os
@@ -12,32 +12,31 @@ DATA_LINE_REGEX = r'^(\d+):\s*(\w+)\s+(\w+)\s+(.+)$'
 HEX_REGEX = r'(:?[0-9a-fA-F]{2})+$'
 
 
-def error(line_number: str, message: str):
-    print(f'DATA ERROR: Line {line_number+1}: {message}')
+class G1ADataException(Exception):
+    """Base class for data parsing exceptions"""
 
 
-# returns True if succeeded, False otherwise
-def add_data_entry(parsed_data: list, memory_size: int, line_number: int, entry: tuple[int, list[int]]) -> bool:
-    address, numbers = entry
-    if address+len(numbers) > memory_size:
-        error(line_number, 'Entry data size exceeds memory capacity. Consider allocating more memory.')
-        return False
-    parsed_data.append(entry)
-    return True
-
-
-def load_file(file_path: str) -> bytes | str:
+def load_file(file_path: str) -> bytes:
+    """
+    Raises:
+        G1ADataException: If the file was not found
+    """
     if not os.path.isfile(file_path):
-        return f'Could not find file "{file_path}".'
+        raise G1ADataException(f'Could not find file "{file_path}".')
 
     with open(file_path, 'rb') as f:
         file_bytes = f.read()
     return file_bytes
 
 
-def load_bytes(bytes_hex: str) -> bytes | str:
+def load_bytes(bytes_hex: str) -> bytes:
+    """
+    Raises:
+        G1ADataException: If the bytes are improperly formatted
+    """
+
     if not re.match(HEX_REGEX, bytes_hex):
-        return 'Expected hex value for byte data.'
+        raise G1ADataException('Expected hex value for byte data.')
     
     return bytes(bytes_hex)
 
@@ -46,11 +45,15 @@ def load_string(string: str) -> bytes:
     return bytes(string, 'ascii')
 
 
-def image_operation(img_data: bytes) -> list[int] | str:
+def image_operation(img_data: bytes) -> list[int]:
+    """
+    Raises:
+        G1ADataException: If the operation failed
+    """
     try:
         img = Image.open(BytesIO(img_data))
     except UnidentifiedImageError:
-        return 'Could not parse bytes as an image.'
+        raise G1ADataException('Could not parse bytes as an image.')
     
     result = [img.width, img.height]
     for i in range(img.height):
@@ -82,8 +85,13 @@ def pack_operation(data: bytes) -> list[int]:
     return result
 
 
-def parse_entry(data_type: str, operation: str, data: str) -> list[int] | str:
-    load_result: bytes | str = b''
+def parse_entry(data_type: str, operation: str, data: str) -> list[int]:
+    """
+    Raises:
+        G1ADataException: If a data parsing error occurs
+    """
+
+    load_result: bytes = b''
     if data_type == 'file':
         load_result = load_file(data)
     elif data_type == 'bytes':
@@ -91,10 +99,7 @@ def parse_entry(data_type: str, operation: str, data: str) -> list[int] | str:
     elif data_type == 'string':
         load_result = load_string(data)
     else:
-        return f'Invalid data type "{data_type}".'
-    
-    if isinstance(load_result, str):
-        return load_result
+        raise G1ADataException(f'Invalid data type "{data_type}".')
 
     data_bytes = load_result
     operation_result: list[int] = None
@@ -105,45 +110,10 @@ def parse_entry(data_type: str, operation: str, data: str) -> list[int] | str:
     elif operation == 'img':
         operation_result = image_operation(data_bytes)
     else:
-        return f'Invalid operation "{operation}".'
-    
-    if isinstance(operation_result, str):
-        return operation_result
+        raise G1ADataException(f'Invalid operation "{operation}".')
     
     # Insert length of string if necessary
     if data_type == 'string':
         operation_result.insert(0, len(operation_result))
     
     return operation_result
-
-
-def parse_data(data_entries: str, memory_size: int) -> list[tuple[int, list[int]]] | None:
-    pattern = re.compile(DATA_LINE_REGEX);
-    parsed_data = []
-    for line_number, line in enumerate(data_entries.split('\n')):
-        m = pattern.match(line)
-        if not m:
-            error(line_number, 'Expected [address]: [data type] [operation] syntax for data entry.')
-            return None
-
-        address = int(m.group(1))
-        data_type = m.group(2)
-        operation = m.group(3)
-        data = m.group(4)
-        parse_entry_result = parse_entry(data_type, operation, data)
-
-        if isinstance(parse_entry_result, str):
-            error(line_number, parse_entry_result)
-
-        added = add_data_entry(parsed_data, memory_size, line_number, (address, parse_entry_result))
-        if not added:
-            return None
-
-    spans = [[a, a+len(data)-1] for a, data in parsed_data]
-    spans.sort(key=lambda x: x[0])
-    for i in range(len(spans)-1):
-        for j in range(i+1, len(spans)):
-            if spans[i][1] >= spans[j][0]:
-                print(f'WARNING: Data overlap found between {spans[i]} and {spans[j]}.')
-    
-    return parsed_data

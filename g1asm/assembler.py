@@ -12,27 +12,15 @@ import json
 from enum import Enum
 from typing import Literal
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from rply import LexerGenerator, Token, LexingError
 from rply.lexer import LexerStream
-from g1asm.data import parse_data
+from g1asm.data import parse_entry, G1ADataException
 from g1asm.binary_format import G1BinaryFormat, ARG_TYPE_LITERAL, ARG_TYPE_ADDRESS, OPCODE_LOOKUP
 from g1asm.instructions import INSTRUCTIONS, ARGUMENT_COUNT_LOOKUP, ASSIGNMENT_INSTRUCTIONS
 
 
-lg = LexerGenerator()
-lg.add('META_VARIABLE', r'#[A-z]+')
-lg.add('NUMBER', r'-?\d+')
-lg.add('ADDRESS', r'\$\d+')
-lg.add('LABEL_NAME', r'[A-z0-9_]+:')
-lg.add('NAME', r'[A-z_][A-z0-9_]*')
-lg.add('COMMENT', r';.*')
-lg.add('NEWLINE', r'\n')
-lg.ignore(r' ')
-lexer = lg.build()
-
-
-META_VARIABLES = {
+DEFAULT_META_VARS = {
     'memory': 128,
     'width': 100,
     'height': 100,
@@ -50,41 +38,300 @@ COLOR_WARN = '\x1b[33m'
 COLOR_RESET = '\x1b[0m'
 
 
+def build_lexer():
+    lg = LexerGenerator()
+    lg.add('META_VARIABLE', r'#[A-z]+')
+
+    lg.add('DATA_ADDRESS', r'@\d+')
+    lg.add('DATA_TYPE', r'file|bytes|string')
+    lg.add('DATA_OPERATION', r'raw|pack|img')
+    lg.add('DATA_STRING', r'([\'\"\`])(.*)\1')
+
+    lg.add('NUMBER', r'-?\d+')
+    lg.add('ADDRESS', r'\$\d+')
+    lg.add('LABEL_NAME', r'[A-z0-9_]+:')
+    lg.add('NAME', r'[A-z_][A-z0-9_]*')
+
+    lg.add('COMMENT', r';.*')
+    lg.add('NEWLINE', r'\n')
+    lg.ignore(r' ')
+    
+    return lg.build()
+
+
 class AssemblerState(Enum):
-    META = 1
-    PROCEDURES = 2
+    META_VARS = 1
+    DATA = 2
+    SUBROUTINES = 3
 
 
 @dataclass
-class AssemblerData:
-    meta: dict[str, int] = field(default_factory=lambda: META_VARIABLES.copy())
-    labels: dict[str, int] = field(default_factory=dict)
-    instruction_tokens: list[tuple[Token, list[Token]]] = field(default_factory=list)
-    instruction_index: int = 0
-    state: AssemblerState = AssemblerState.META
-
-    instructions: list[tuple[str, list[str | int], int]] = field(default_factory=list)
-    start_label: int = -1
-    tick_label: int = -1
-    data_entries: list[tuple[int, list[int]]] | None = None
-
-    source_lines: list[str] | None = None
+class Instruction:
+    name: str
+    arguments: list[Token]
+    line_number: int
 
 
-    def add_data_entries(self, data_file_path: str):
-        if os.path.isfile(data_file_path):
-            with open(data_file_path, 'r') as f:
-                data = parse_data(f.read(), self.meta['memory'])
-                if data is not None:
-                    self.data_entries = data
+@dataclass
+class ParsedInstruction:
+    name: str
+    arguments: list[int | str]
+    line_number: int
+
+    def to_json(self, include_source: bool):
+        if include_source:
+            return (self.name, self.arguments, self.line_number)
+        return (self.name, self.arguments)
+
+
+@dataclass
+class DataEntry:
+    address: int
+    data: list[int]
+
+    def to_json(self):
+        return (self.address, self.data)
+
+
+class Assembler:
+    def __init__(self, tokens: LexerStream, source_lines: list[str]):
+        self.tokens = tokens
+        self.source_lines = source_lines
+
+        self.state = AssemblerState.META_VARS
+        self.current_token = None
+
+        self.meta_vars = DEFAULT_META_VARS.copy()
+        self.labels: dict[str, int] = {}
+        self.instruction_index: int = 0
+        self.instructions: list[Instruction] = []
+
+        self.parsed_instructions: list[ParsedInstruction] = []
+        self.start_label: int = -1
+        self.tick_label: int = -1
+        self.data_entries: list[DataEntry] = []
+
+
+    def error(self, message: str, token: Token | None=None):
+        if token is None:
+            token = self.current_token
+        
+        line_number = token.source_pos.lineno-1
+        column_number = token.source_pos.colno-1
+        print(f'{COLOR_ERROR}ASSEMBLER ERROR: {message}')
+        print(f'{line_number+1} | {self.source_lines[line_number]}')
+        print(f'{" " * (len(str(line_number))+3+column_number)}^')
+        print(COLOR_RESET, end='')
+
+        sys.exit()
+    
+
+    def warning(self, message: str, token: Token | None=None):
+        if token is None:
+            token = self.current_token
+        
+        line_number = token.source_pos.lineno-1
+        column_number = token.source_pos.colno-1
+        print(f'{COLOR_WARN}ASSEMBLER WARNING: {message}')
+        print(f'{line_number+1} | {self.source_lines[line_number]}')
+        print(f'{" " * (len(str(line_number))+3+column_number)}^')
+        print(COLOR_RESET, end='')
+    
+
+    def next_token(self, token_name: str):
+        try:
+            next_token = self.tokens.next()
+        except StopIteration:
+            self.error()
+        
+        if next_token.name != token_name:
+            self.error(next_token, f'Expected "{token_name}" token but got "{next_token.name}"')
+        
+        return next_token
+
+    def get_until_newline(self) -> list[Token]:
+        returned_tokens = []
+        while True:
+            token = self.tokens.next()
+            if token.name == 'COMMENT':
+                continue
+            if token.name == 'NEWLINE':
+                break
+            returned_tokens.append(token)
+        return returned_tokens
+
+    def parse_argument_token(self, token: Token) -> str | int:
+        if token.name == 'NUMBER':
+            parsed = int(token.value)
+            if parsed < INT_RANGE_LOWER or parsed > INT_RANGE_UPPER:
+                self.error(f'Integer value {token.value} is outside the 32 bit signed integer range.', token)
+            return parsed
+        
+        elif token.name == 'NAME':
+            if token.value not in self.labels:
+                self.error(f'Undefined label "{token.value}".', token)
+            return self.labels[token.value]
+
+        elif token.name == 'ADDRESS':
+            parsed_address = int(token.value[1:])
+            if parsed_address < INT_RANGE_LOWER or parsed_address > INT_RANGE_UPPER:
+                self.error(f'Address value {token.value} is outside the 32 bit signed integer range.', token)
+            return token.value
+
+        return token.value
+
+
+    def check_misplaced_meta_var(self):
+        if self.current_token.name == 'META_VARIABLE':
+            self.error(f'Got a misplaced meta variable.')
+    
+    def check_misplaced_data_entry(self):
+        if self.current_token.name == 'DATA_ADDRESSS':
+            self.error(f'Got a misplaced data entry.')
+    
+
+    def check_data_entry_spans(self):
+        spans = [[e.address, e.address+len(e.data)-1] for e in self.data_entries]
+        spans.sort(key=lambda x: x[0])
+
+        for i in range(len(spans)-1):
+            for j in range(i+1, len(spans)):
+                if spans[i][1] >= spans[j][0]:
+                    self.warning(f'Data overlap found between {spans[i]} and {spans[j]}.')
+    
+
+    def parse_instruction_args(self):
+        for instruction in self.instructions:
+            parsed_args = [self.parse_argument_token(t) for t in instruction.arguments]
+            first_argument = parsed_args[0]
+            if instruction.name in ASSIGNMENT_INSTRUCTIONS and isinstance(first_argument, int) and first_argument <= 11:
+                self.warning('Assignment to a reserved memory location.', parsed_args[0])
+
+            self.parsed_instructions.append(
+                ParsedInstruction(
+                    instruction.name, parsed_args, instruction.line_number
+                )
+            )
+
+
+    def assemble_meta_vars(self):
+        if self.current_token.name == 'META_VARIABLE':
+            meta_variable_name = self.current_token.value[1:]
+            if meta_variable_name not in DEFAULT_META_VARS:
+                self.error(f'Unrecognized meta variable "{meta_variable_name}".')
+            
+            value_token = self.next_token('NUMBER')
+            self.meta_vars[meta_variable_name] = int(value_token.value)
+        
+        elif self.current_token.name == 'DATA_ADDRESS':
+            self.state = AssemblerState.DATA
+
+        elif self.current_token.name == 'LABEL_NAME':
+            self.state = AssemblerState.SUBROUTINES
+        
         else:
-            print('Could not find data file at "{data_file_path}".')
+            self.error(f'Expected meta variable definition but got "{self.current_token.name}".')
 
 
-    def assemble_json(self) -> bytes:
+    def assemble_data_entries(self):
+        self.check_misplaced_meta_var()
+
+        if self.current_token.name == 'DATA_ADDRESS':
+            type_token = self.next_token('DATA_TYPE')
+            operation_token = self.next_token('DATA_OPERATION')
+            string_token = self.next_token('DATA_STRING')
+
+            address = int(self.current_token.value[1:])
+            data_type = type_token.value
+            operation = operation_token.value
+            data_string = string_token.value[1:-1]
+
+            try:
+                entry_data = parse_entry(data_type, operation, data_string)
+            except G1ADataException as e:
+                self.error(str(e))
+
+            if address+len(entry_data) > self.meta_vars['memory']:
+                self.error('Entry data size exceeds memory capacity. Consider allocating more memory.')
+            
+            self.data_entries.append(DataEntry(
+                address, entry_data
+            ))
+
+        elif self.current_token.name == 'LABEL_NAME':
+            self.state = AssemblerState.SUBROUTINES
+
+        else:
+            self.error(f'Expected data entry but got "{self.current_token.name}".')
+
+    
+    def assemble_subroutines(self):
+        self.check_misplaced_meta_var()
+        self.check_misplaced_data_entry()
+
+        if self.current_token.name == 'LABEL_NAME':
+            label_name = self.current_token.value[:-1]
+            if label_name in self.labels:
+                self.warning(f'Label "{label_name}" declared more than once.')
+            else:
+                self.labels[label_name] = self.instruction_index
+        
+        elif self.current_token.name == 'NAME':
+            instruction_name = self.current_token.value
+            if instruction_name not in INSTRUCTIONS:
+                self.error(f'Unrecognized instruction "{instruction_name}".')
+
+            instruction_arg_amount = ARGUMENT_COUNT_LOOKUP[instruction_name]
+            instruction_args = self.get_until_newline()
+            if len(instruction_args) != instruction_arg_amount:
+                self.error(f'Expected {instruction_arg_amount} argument(s) for instruction "{instruction_name}" but got {len(instruction_args)}.')
+            
+            self.instructions.append(
+                Instruction(
+                    instruction_name, instruction_args, 
+                    self.current_token.source_pos.lineno-1
+                )
+            )
+            self.instruction_index += 1
+
+        else:
+            self.error(f'Expected label name or instruction name but got "{self.current_token.name}"')
+
+    def assemble(self):
+        try:
+            for self.current_token in self.tokens:
+                if self.current_token.name in {'NEWLINE', 'COMMENT'}:
+                    continue
+
+                if self.state == AssemblerState.META_VARS:
+                    self.assemble_meta_vars()
+                
+                if self.state == AssemblerState.DATA:
+                    self.assemble_data_entries()
+
+                if self.state == AssemblerState.SUBROUTINES:
+                    self.assemble_subroutines()
+        
+        except LexingError:
+            self.error('Unrecognized token.')
+        
+        self.check_data_entry_spans()
+        self.parse_instruction_args()
+
+        # Check for start and tick labels
+        if 'tick' in self.labels:
+            self.tick_label = self.labels['tick']
+        else:
+            print(f'{COLOR_WARN}WARNING: "tick" label not found in program.{COLOR_RESET}')
+        
+        if 'start' in self.labels:
+            self.start_label = self.labels['start']
+
+
+    def assemble_json(self, include_source: bool) -> bytes:
         output_json = {
-            'meta': self.meta,
-            'instructions': self.instructions
+            'meta': self.meta_vars,
+            'instructions': [i.to_json(include_source) for i in self.parsed_instructions]
         }
 
         if self.start_label != -1:
@@ -92,10 +339,10 @@ class AssemblerData:
         if self.tick_label != -1:
             output_json['tick'] = self.tick_label
         
-        if self.data_entries is not None:
-            output_json['data'] = self.data_entries
+        if self.data_entries:
+            output_json['data'] = [e.to_json() for e in self.data_entries]
         
-        if self.source_lines is not None:
+        if include_source:
             output_json['source'] = self.source_lines
         
         return json.dumps(output_json, separators=(',', ':')).encode('utf-8')
@@ -103,15 +350,17 @@ class AssemblerData:
     
     def assemble_binary(self) -> bytes:
         file_dict = {
-            'meta': self.meta,
-            'instruction_count': len(self.instructions),
+            'meta': self.meta_vars,
+            'instruction_count': len(self.parsed_instructions),
             'start': self.start_label,
             'tick': self.tick_label
         }
 
         formatted_instructions = []
-        for instruction_data in self.instructions:
-            instruction_name, arguments = instruction_data[:2]  # only grab the first 2 in case of debug mode
+        for instruction in self.parsed_instructions:
+            instruction_name = instruction.name
+            arguments = instruction.arguments
+
             formatted_arguments = []
             for argument in arguments:
                 if isinstance(argument, int):
@@ -126,10 +375,13 @@ class AssemblerData:
             formatted_instructions.append(verbose_instruction)
         file_dict['instructions'] = formatted_instructions
 
-        if self.data_entries is not None:
+        if self.data_entries:
             formatted_data_entries = []
-            for address, data_values in self.data_entries:
+            for entry in self.data_entries:
+                address = entry.address
+                data_values = entry.data
                 formatted_data_entries.append({'address': address, 'size': len(data_values), 'values': data_values})
+            
             file_dict['data_entry_count'] = len(formatted_data_entries)
             file_dict['data'] = formatted_data_entries
         else:
@@ -139,144 +391,24 @@ class AssemblerData:
         return G1BinaryFormat.build(file_dict)
 
 
-def error(token: Token, source_lines: list[str], message: str):
-    line_number = token.source_pos.lineno-1
-    column_number = token.source_pos.colno-1
-    print(f'{COLOR_ERROR}ASSEMBLER ERROR: {message}')
-    print(f'{line_number+1} | {source_lines[line_number]}')
-    print(f'{" " * (len(str(line_number))+3+column_number)}^')
-    print(COLOR_RESET, end='')
-    sys.exit()
-
-
-def warn(token: Token, source_lines: list[str], message: str):
-    line_number = token.source_pos.lineno-1
-    column_number = token.source_pos.colno-1
-    print(f'{COLOR_WARN}ASSEMBLER WARNING: {message}')
-    print(f'{line_number+1} | {source_lines[line_number]}')
-    print(f'{" " * (len(str(line_number))+3+column_number)}^')
-    print(COLOR_RESET, end='')
-
-
-def get_until_newline(tokens: LexerStream) -> list[Token]:
-    returned_tokens = []
-    while True:
-        token = tokens.next()
-        if token.name == 'COMMENT':
-            continue
-        if token.name == 'NEWLINE':
-            break
-        returned_tokens.append(token)
-    return returned_tokens
-
-
-def parse_argument_token(token: Token, labels: dict[str, int], source_lines: list[str]) -> str | int:
-    if token.name == 'NUMBER':
-        parsed = int(token.value)
-        if parsed < INT_RANGE_LOWER or parsed > INT_RANGE_UPPER:
-            error(token, source_lines, f'Integer value {token.value} is outside the 32 bit signed integer range.')
-        return parsed
-    if token.name == 'NAME':
-        if token.value not in labels:
-            error(token, source_lines, f'Undefined label "{token.value}".')
-        return labels[token.value]
-    if token.name == 'ADDRESS':
-        parsed_address = int(token.value[1:])
-        if parsed_address < INT_RANGE_LOWER or parsed_address > INT_RANGE_UPPER:
-            error(token, source_lines, f'Address value {token.value} is outside the 32 bit signed integer range.')
-        return token.value
-    return token.value
-
-
-def assemble_tokens(tokens: LexerStream, source_lines: list[str], include_source: bool=False):
-    assembler_data = AssemblerData()
-
-    for token in tokens:
-        if token.name == 'META_VARIABLE':
-            if assembler_data.state != AssemblerState.META:
-                error(token, source_lines, f'Found meta variable outside file header.')
-            meta_variable_name = token.value[1:]
-            if meta_variable_name not in META_VARIABLES:
-                error(token, source_lines, f'Unrecognized meta variable "{meta_variable_name}".')
-            assembler_data.meta[meta_variable_name] = int(tokens.next().value)
-        
-        elif token.name == 'LABEL_NAME':
-            if assembler_data.state != AssemblerState.PROCEDURES:
-                assembler_data.state = AssemblerState.PROCEDURES
-            label_name = token.value[:-1]
-            if label_name in assembler_data.labels:
-                warn(token, source_lines, f'Label "{label_name}" declared more than once.')
-            else:
-                assembler_data.labels[label_name] = assembler_data.instruction_index
-        
-        elif token.name == 'NAME':
-            if token.value not in INSTRUCTIONS:
-                error(token, source_lines, f'Unrecognized instruction "{token.value}".')
-
-            instruction_name_token = token.value
-            instruction_arg_amount = ARGUMENT_COUNT_LOOKUP[token.value]
-            instruction_args = get_until_newline(tokens)
-            if len(instruction_args) != instruction_arg_amount:
-                error(token, source_lines, f'Expected {instruction_arg_amount} argument(s) for instruction "{instruction_name_token}" but got {len(instruction_args)}.')
-            assembler_data.instruction_tokens.append((token, instruction_args))
-            assembler_data.instruction_index += 1
-        
-        elif token.name in {'NUMBER', 'ADDRESS'}:
-            error(token, source_lines, 'Value outside of instruction.')
-        
-        elif token.name in {'COMMENT', 'NEWLINE'}:
-            continue
-    
-    # Parse instruction args
-    for instruction_name_token, instruction_args_tokens in assembler_data.instruction_tokens:
-        instruction_name: str = instruction_name_token.value 
-        instruction_args = [parse_argument_token(t, assembler_data.labels, source_lines) for t in instruction_args_tokens]
-        first_argument = instruction_args[0]
-        if instruction_name in ASSIGNMENT_INSTRUCTIONS and isinstance(first_argument, int) and first_argument <= 11:
-            warn(instruction_args_tokens[0], source_lines, 'Assignment to a reserved memory location.')
-        if include_source:
-            instruction_data = (instruction_name, instruction_args, instruction_name_token.source_pos.lineno-1)
-        else:
-            instruction_data = (instruction_name, instruction_args)
-        assembler_data.instructions.append(instruction_data)
-    
-    # Check for start and tick labels
-    if 'tick' in assembler_data.labels:
-        assembler_data.tick_label = assembler_data.labels['tick']
-    else:
-        print('WARNING: "tick" label not found in program.')
-    if 'start' in assembler_data.labels:
-        assembler_data.start_label = assembler_data.labels['start']
-    
-    # Add source lines if necessary
-    if include_source:
-        assembler_data.source_lines = source_lines
-    
-    return assembler_data
-
-
-def assemble(input_path: str, output_path: str, data_file_path: str|None, include_source: bool, output_format: OUTPUT_FORMATS):
+def assemble(input_path: str, output_path: str, include_source: bool, output_format: OUTPUT_FORMATS):
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f'File "{input_path}" does not exist.')
     with open(input_path, 'r') as f:
         source_code = f.read()
     
     source_lines = source_code.split('\n')
+    lexer = build_lexer()
     tokens = lexer.lex(source_code + '\n')
-    try:
-        assembler_data = assemble_tokens(tokens, source_lines, include_source)
-    except LexingError as e:
-        error(e, source_lines, 'Unrecognized token.')
-    
-    # Add data entries
-    if data_file_path is not None:
-        assembler_data.add_data_entries(data_file_path)
+
+    assembler = Assembler(tokens, source_lines)
+    assembler.assemble()
 
     # Set file content based on the output format
     if output_format == 'json':
-        file_content = assembler_data.assemble_json()
+        file_content = assembler.assemble_json(include_source)
     else:
-        file_content = assembler_data.assemble_binary()
+        file_content = assembler.assemble_binary()
     
     # Write the output file
     with open(output_path, 'wb') as f:
@@ -288,7 +420,6 @@ def main():
         parser = argparse.ArgumentParser(description='Assemble a g1 program')
         parser.add_argument('input_path', help='The path to the input g1 assembly program')
         parser.add_argument('output_path', help='The path to the assembled g1 program')
-        parser.add_argument('--data_path', '-d', type=str, default=None, help='The path to a data file (.g1d) for the program')
         parser.add_argument('--include_source', '-src', action='store_true', help='Include the source lines in the assembled program. Only works if the output format is .json')
         parser.add_argument('--output_format', '-o', default=None, choices=['g1b', 'json'], help='The output format for the assembled program')
         args = parser.parse_args()
@@ -309,7 +440,7 @@ def main():
         else:
             output_format = DEFAULT_OUTPUT_FORMAT
     
-    assemble(args.input_path, args.output_path, args.data_path, args.include_source, output_format)
+    assemble(args.input_path, args.output_path, args.include_source, output_format)
     return 0
 
 
