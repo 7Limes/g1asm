@@ -1,13 +1,13 @@
 [project]
 name = "g1asm"
-version = "0.3.0"
+version = "0.3.1"
 description = "Assembler implementation for the g1 ISA"
 authors = [
     {name = "7Limes"}
 ]
 license = "MIT"
 readme = "README.md"
-keywords = ["assembler", "cli"]
+keywords = ["assembler", "cli", "language"]
 
 requires-python = ">=3.10"
 dependencies = [

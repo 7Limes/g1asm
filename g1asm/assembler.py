@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Literal
 import argparse
 from dataclasses import dataclass
+import re
 from rply import LexerGenerator, Token, LexingError
 from rply.lexer import LexerStream
 from g1asm.data import parse_entry, G1ADataException
@@ -37,20 +38,19 @@ COLOR_ERROR = '\x1b[31m'
 COLOR_WARN = '\x1b[33m'
 COLOR_RESET = '\x1b[0m'
 
+DATA_ENTRY_REGEX = r'@(\d+)\s+(file|bytes|string)\s+(raw|pack|img)\s+([\'\"\`])(.*)\4'
+
 
 def build_lexer():
     lg = LexerGenerator()
     lg.add('META_VARIABLE', r'#[A-z]+')
 
-    lg.add('DATA_ADDRESS', r'@\d+')
-    lg.add('DATA_TYPE', r'file|bytes|string')
-    lg.add('DATA_OPERATION', r'raw|pack|img')
-    lg.add('DATA_STRING', r'([\'\"\`])(.*)\1')
-
     lg.add('NUMBER', r'-?\d+')
     lg.add('ADDRESS', r'\$\d+')
     lg.add('LABEL_NAME', r'[A-z0-9_]+:')
     lg.add('NAME', r'[A-z_][A-z0-9_]*')
+
+    lg.add('DATA_ENTRY', DATA_ENTRY_REGEX)
 
     lg.add('COMMENT', r';.*')
     lg.add('NEWLINE', r'\n')
@@ -140,14 +140,14 @@ class Assembler:
 
     def next_token(self, token_name: str):
         try:
-            next_token = self.tokens.next()
+            next_tok = self.tokens.next()
         except StopIteration:
-            self.error()
+            self.error(f'Reached end of token stream while trying to get token "{token_name}"')
         
-        if next_token.name != token_name:
-            self.error(next_token, f'Expected "{token_name}" token but got "{next_token.name}"')
+        if next_tok.name != token_name:
+            self.error(next_tok, f'Expected "{token_name}" token but got "{next_tok.name}"')
         
-        return next_token
+        return next_tok
 
     def get_until_newline(self) -> list[Token]:
         returned_tokens = []
@@ -186,7 +186,7 @@ class Assembler:
             self.error(f'Got a misplaced meta variable.')
     
     def check_misplaced_data_entry(self):
-        if self.current_token.name == 'DATA_ADDRESSS':
+        if self.current_token.name == 'DATA_ENTRY':
             self.error(f'Got a misplaced data entry.')
     
 
@@ -223,7 +223,7 @@ class Assembler:
             value_token = self.next_token('NUMBER')
             self.meta_vars[meta_variable_name] = int(value_token.value)
         
-        elif self.current_token.name == 'DATA_ADDRESS':
+        elif self.current_token.name == 'DATA_ENTRY':
             self.state = AssemblerState.DATA
 
         elif self.current_token.name == 'LABEL_NAME':
@@ -236,15 +236,14 @@ class Assembler:
     def assemble_data_entries(self):
         self.check_misplaced_meta_var()
 
-        if self.current_token.name == 'DATA_ADDRESS':
-            type_token = self.next_token('DATA_TYPE')
-            operation_token = self.next_token('DATA_OPERATION')
-            string_token = self.next_token('DATA_STRING')
+        if self.current_token.name == 'DATA_ENTRY':
+            entry_string = self.current_token.value
+            entry_match = re.match(DATA_ENTRY_REGEX, entry_string)
 
-            address = int(self.current_token.value[1:])
-            data_type = type_token.value
-            operation = operation_token.value
-            data_string = string_token.value[1:-1]
+            address = int(entry_match.group(1))
+            data_type = entry_match.group(2)
+            operation = entry_match.group(3)
+            data_string = entry_match.group(5)
 
             try:
                 entry_data = parse_entry(data_type, operation, data_string)
